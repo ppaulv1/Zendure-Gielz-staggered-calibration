@@ -1,0 +1,94 @@
+type: vertical-stack
+cards:
+  - type: entities
+    title: Zendure calibration
+    show_header_toggle: false
+    entities:
+      - entity: input_boolean.zendure_calibration_active
+        name: Run active
+      - type: simple-entity
+        entity: input_text.zendure_calibration_phase
+        name: Phase
+      - entity: input_datetime.zendure_calibration_last_set_1
+        name: Set 1 last run
+      - entity: input_datetime.zendure_calibration_last_set_2
+        name: Set 2 last run
+      - entity: input_datetime.zendure_calibration_deadline
+        name: Deadline of current run
+      - type: simple-entity
+        entity: input_text.zendure_setting_ip_address
+        name: Gielz Zendure IP address
+      - entity: automation.zendure_zensdk_gielz_global
+        name: Gielz automation
+      - entity: sensor.zendure_set_1_next_calibration
+        name: Set 1 next run
+        format: datetime
+      - entity: sensor.zendure_set_2_next_calibration
+        name: Set 2 next run
+        format: datetime
+      - entity: input_datetime.zendure_calibration_check_time
+        name: Daily check time
+  - type: horizontal-stack
+    cards:
+      - type: button
+        name: Dry run set 1
+        icon: mdi:flask-outline
+        tap_action:
+          action: perform-action
+          perform_action: script.turn_on
+          target:
+            entity_id: script.zendure_calibration_run
+          data:
+            variables:
+              calibration_set: 1
+              dry_run: true
+      - type: button
+        name: Dry run set 2
+        icon: mdi:flask-outline
+        tap_action:
+          action: perform-action
+          perform_action: script.turn_on
+          target:
+            entity_id: script.zendure_calibration_run
+          data:
+            variables:
+              calibration_set: 2
+              dry_run: true
+  - type: horizontal-stack
+    cards:
+      - type: button
+        name: Calibrate set 1 now
+        icon: mdi:battery-sync
+        tap_action:
+          action: perform-action
+          perform_action: script.turn_on
+          target:
+            entity_id: script.zendure_calibration_run
+          data:
+            variables:
+              calibration_set: 1
+              dry_run: false
+          confirmation:
+            text: Start a real calibration of set 1? Gielz is paused while it runs.
+      - type: button
+        name: Calibrate set 2 now
+        icon: mdi:battery-sync
+        tap_action:
+          action: perform-action
+          perform_action: script.turn_on
+          target:
+            entity_id: script.zendure_calibration_run
+          data:
+            variables:
+              calibration_set: 2
+              dry_run: false
+          confirmation:
+            text: Start a real calibration of set 2? Gielz is paused while it runs.
+  - type: button
+    name: Stop and revert
+    icon: mdi:stop-circle-outline
+    tap_action:
+      action: perform-action
+      perform_action: script.turn_on
+      target:
+        entity_id: script.zendure_calibration_stop
