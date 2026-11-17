@@ -1,0 +1,490 @@
+# packages/zendure_calibration.yaml
+#
+# Staggered calibration for 2 Zendure sets behind the gast777 proxy, with the Gielz automation.
+# One set at a time is charged to 100 % by pointing Gielz directly at that set's own IP address.
+#
+# Sequence of one run (script.zendure_calibration_run):
+#   1  preconditions checked (nothing is touched if one fails)
+#   2  Gielz main automation paused   (so the IP change does NOT trigger its "recommended settings" reset)
+#   3  all sets to standby through the proxy, confirmed
+#   4  Zendure IP-address -> real IP of the chosen set, confirmed by the serial number
+#   5  charge to 100 %, wait until the calibration flag is clear
+#   6  date of this run stored for that set
+#   7  revert (script.zendure_calibration_revert): set standby, IP back to the proxy, Gielz automation back on
+#
+# Schedule (automation "daily check"): every set must be calibrated within 28 days of its last run.
+# A set is due at 28+ days; only one set is started per day (so the sets are at least 1 day apart).
+# If neither is due but both reach 27 days, one is started a day early so that neither passes 28 days.
+# The check time comes from input_datetime.zendure_calibration_check_time (zendure_calibration_next_run.yaml).
+#
+# Fail-safes: every abort path calls the revert script; a watchdog (every minute and at HA start)
+# reverts if the run script is gone (HA restart, crash) or the deadline passed.
+
+input_boolean:
+  zendure_calibration_active:
+    name: Zendure calibration active
+    icon: mdi:battery-sync
+
+input_text:
+  zendure_calibration_saved_ip:
+    name: Zendure calibration saved proxy address
+    max: 100
+  zendure_calibration_phase:
+    name: Zendure calibration phase
+    max: 100
+
+input_datetime:
+  zendure_calibration_last_set_1:
+    name: Zendure set 1 last calibration run
+    has_date: true
+    has_time: true
+  zendure_calibration_last_set_2:
+    name: Zendure set 2 last calibration run
+    has_date: true
+    has_time: true
+  zendure_calibration_deadline:
+    name: Zendure calibration deadline
+    has_date: true
+    has_time: true
+
+script:
+  # ------------------------------------------------------------------------------------------
+  zendure_calibration_revert:
+    alias: Zendure calibration - revert to proxy
+    mode: single
+    variables:
+      # must be the same entity as in the run script; check it in Settings > Automations
+      gielz_automation: automation.zendure_zensdk_gielz_global
+      saved_ip: "{{ states('input_text.zendure_calibration_saved_ip') }}"
+    sequence:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_phase
+        data:
+          value: reverting
+      - if:
+          - condition: template
+            value_template: >
+              {{ saved_ip not in ['', 'unknown', 'unavailable']
+                 and states('input_text.zendure_setting_ip_address') != saved_ip }}
+        then:
+          # still pointed at a real device: wait for a valid reading, park it, then switch back
+          - wait_template: >
+              {% set sn = states('sensor.zendure_serial_number') %}
+              {{ sn not in ['unknown', 'unavailable', ''] and 'PROXY' not in sn }}
+            timeout: "00:01:00"
+            continue_on_timeout: true
+          # like Gielz itself, never send standby while the device reports that it is calibrating
+          - if:
+              - condition: template
+                value_template: "{{ not is_state('sensor.zendure_calibrating', 'Yes') }}"
+            then:
+              - action: rest_command.zendure_full_standby
+                continue_on_error: true
+                data:
+                  sn: "{{ states('sensor.zendure_serial_number') }}"
+              - delay: "00:00:03"
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.zendure_setting_ip_address
+            data:
+              value: "{{ saved_ip }}"
+          - wait_template: "{{ 'PROXY' in states('sensor.zendure_serial_number') }}"
+            timeout: "00:02:00"
+            continue_on_timeout: true
+          - if:
+              - condition: template
+                value_template: "{{ not wait.completed }}"
+            then:
+              - action: persistent_notification.create
+                data:
+                  title: Zendure calibration - check Gielz
+                  notification_id: zendure_calibration_check
+                  message: >
+                    The IP address was set back to {{ saved_ip }}, but Gielz does not yet report the
+                    proxy serial number. Check that the Node-RED proxy is running.
+      - action: automation.turn_on
+        target:
+          entity_id: "{{ gielz_automation }}"
+      - if:
+          - condition: template
+            value_template: "{{ ':' not in states('input_text.zendure_setting_ip_address') }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration - ACTION NEEDED
+              notification_id: zendure_calibration_ip
+              message: >
+                Gielz is still pointed at {{ states('input_text.zendure_setting_ip_address') }}, which
+                does not look like the proxy address (IP:port/endpoint). Set "Zendure IP-address" on the
+                Gielz dashboard back to the proxy address by hand.
+      - action: input_boolean.turn_off
+        target:
+          entity_id: input_boolean.zendure_calibration_active
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_phase
+        data:
+          value: idle
+
+  # ------------------------------------------------------------------------------------------
+  zendure_calibration_run:
+    alias: Zendure calibration - run one set
+    mode: single
+    fields:
+      calibration_set:
+        description: Which set to calibrate, 1 or 2 (same order as the IP addresses in the proxy).
+        example: 1
+      dry_run:
+        description: true = do everything except charging (tests the IP switch and the revert).
+        example: true
+    variables:
+      # ---------------- SETTINGS: edit these ----------------
+      gielz_automation: automation.zendure_zensdk_gielz_global
+      ip_set_1: "192.168.1.101"      # real IP of Zendure 1 (as entered in the proxy)
+      ip_set_2: "192.168.1.102"      # real IP of Zendure 2
+      charge_power: 1200             # W, limited to the device maximum
+      max_hours: 10                  # hard stop for the whole run
+      # -------------------------------------------------------
+      cal_set: "{{ calibration_set | default(0) | int(0) }}"
+      dry: "{{ dry_run | default(false) | bool(false) }}"
+      real_ip: "{{ ip_set_1 if cal_set == 1 else (ip_set_2 if cal_set == 2 else '') }}"
+      current_ip: "{{ states('input_text.zendure_setting_ip_address') }}"
+      heartbeat_age: >
+        {{ (as_timestamp(now())
+            - (state_attr('input_datetime.zendure_gielz_automation_last_time_executed', 'timestamp') | float(0))) }}
+      problems: >
+        {% set p = [] %}
+        {% if cal_set not in [1, 2] %}{% set p = p + ['calibration_set must be 1 or 2'] %}{% endif %}
+        {% if real_ip.split('.') | length != 4 or ':' in real_ip %}{% set p = p + ['no valid real IP for this set'] %}{% endif %}
+        {% if ip_set_1 == ip_set_2 %}{% set p = p + ['ip_set_1 and ip_set_2 are identical'] %}{% endif %}
+        {% if is_state('input_boolean.zendure_calibration_active', 'on') %}{% set p = p + ['a calibration run is already marked active'] %}{% endif %}
+        {% if not is_state(gielz_automation, 'on') %}{% set p = p + ['Gielz automation ' ~ gielz_automation ~ ' is not on (or the entity id is wrong)'] %}{% endif %}
+        {% if ':' not in current_ip or current_ip in [ip_set_1, ip_set_2] %}{% set p = p + ['Zendure IP-address (' ~ current_ip ~ ') does not look like the proxy address'] %}{% endif %}
+        {% if 'PROXY' not in states('sensor.zendure_serial_number') %}{% set p = p + ['Gielz is not receiving proxy data (serial number has no PROXY)'] %}{% endif %}
+        {% if heartbeat_age | float(9999) > 300 %}{% set p = p + ['Gielz automation heartbeat is older than 5 minutes'] %}{% endif %}
+        {% if states('input_number.zendure_setting_maximum_allowed_state_of_charge') | float(0) < 100 %}{% set p = p + ['Gielz maximum allowed state of charge is below 100 %'] %}{% endif %}
+        {{ p | join('; ') }}
+    sequence:
+      # ---- 1  preconditions: nothing has been touched yet -------------------------------------
+      - if:
+          - condition: template
+            value_template: "{{ problems | trim != '' }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration not started
+              notification_id: zendure_calibration_result
+              message: "{{ problems }}"
+          - stop: preconditions failed
+
+      # ---- 2  mark active, remember the proxy address, set deadline, pause Gielz --------------
+      - action: input_boolean.turn_on
+        target:
+          entity_id: input_boolean.zendure_calibration_active
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_saved_ip
+        data:
+          value: "{{ current_ip }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.zendure_calibration_deadline
+        data:
+          datetime: "{{ (now() + timedelta(hours=max_hours)).strftime('%Y-%m-%d %H:%M:%S') }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_phase
+        data:
+          value: "set {{ cal_set }}: standby"
+      - action: automation.turn_off
+        target:
+          entity_id: "{{ gielz_automation }}"
+
+      # ---- 3  everything to standby through the proxy ------------------------------------------
+      - action: rest_command.zendure_full_standby
+        continue_on_error: true
+        data:
+          sn: "{{ states('sensor.zendure_serial_number') }}"
+      - wait_template: >
+          {{ is_state('sensor.zendure_storage_mode', 'Flash Memory')
+             and (states('sensor.zendure_power') | float(999)) | abs < 60 }}
+        timeout: "00:03:00"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration aborted
+              notification_id: zendure_calibration_result
+              message: >
+                The sets did not go to standby (storage mode {{ states('sensor.zendure_storage_mode') }},
+                power {{ states('sensor.zendure_power') }} W). Nothing was changed; Gielz is resumed.
+          - action: script.zendure_calibration_revert
+          - stop: standby failed
+
+      # ---- 4  point Gielz at the real device ----------------------------------------------------
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_phase
+        data:
+          value: "set {{ cal_set }}: direct {{ real_ip }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_setting_ip_address
+        data:
+          value: "{{ real_ip }}"
+      - wait_template: >
+          {% set sn = states('sensor.zendure_serial_number') %}
+          {{ sn not in ['unknown', 'unavailable', ''] and 'PROXY' not in sn
+             and states('sensor.zendure_total_state_of_charge') | is_number }}
+        timeout: "00:01:00"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration aborted
+              notification_id: zendure_calibration_result
+              message: "Set {{ cal_set }} did not answer on {{ real_ip }}. Reverted to the proxy."
+          - action: script.zendure_calibration_revert
+          - stop: device not reachable
+      - delay: "00:00:03"
+      - variables:
+          dev_sn: "{{ states('sensor.zendure_serial_number') }}"
+          start_soc: "{{ states('sensor.zendure_total_state_of_charge') }}"
+
+      # ---- dry run: show what Gielz sees on the real device, then revert -------------------------
+      - if:
+          - condition: template
+            value_template: "{{ dry }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration dry run OK
+              notification_id: zendure_calibration_result
+              message: >
+                Gielz was pointed at set {{ cal_set }} ({{ real_ip }}, serial {{ dev_sn }}).
+                State of charge {{ start_soc }} %, storage mode {{ states('sensor.zendure_storage_mode') }},
+                calibrating {{ states('sensor.zendure_calibrating') }},
+                max charge power {{ states('sensor.zendure_inverter_max_charge_power') }} W.
+                No charge command was sent. Reverting now.
+          - delay: "00:00:20"
+          - action: script.zendure_calibration_revert
+          - stop: dry run finished
+
+      # ---- already full: nothing would be charged, so do not record a calibration ----------------
+      - if:
+          - condition: template
+            value_template: "{{ start_soc | float(0) >= 99 }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration skipped
+              notification_id: zendure_calibration_result
+              message: >
+                Set {{ cal_set }} is already at {{ start_soc }} %, so there is nothing to charge and no calibration
+                was recorded. It will be tried again tomorrow. Choose an earlier start time (before the sun
+                fills the battery) if this keeps happening.
+          - action: script.zendure_calibration_revert
+          - stop: already full
+
+      # ---- 5  charge --------------------------------------------------------------------------
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_phase
+        data:
+          value: "set {{ cal_set }}: charging"
+      - action: rest_command.zendure_save_in_ram
+        continue_on_error: true
+        data:
+          sn: "{{ dev_sn }}"
+      - delay: "00:00:02"
+      - action: rest_command.zendure_quick_charge
+        continue_on_error: true
+        data:
+          sn: "{{ dev_sn }}"
+          inputLimit: >
+            {{ [charge_power | int(1200), states('sensor.zendure_inverter_max_charge_power') | int(charge_power)] | min }}
+      - wait_template: >
+          {{ states('sensor.zendure_power') | float(0) > 50
+             or states('sensor.zendure_total_state_of_charge') | float(0) >= 100 }}
+        timeout: "00:03:00"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration aborted
+              notification_id: zendure_calibration_result
+              message: >
+                Set {{ cal_set }} did not start charging (power {{ states('sensor.zendure_power') }} W).
+                Reverted to the proxy.
+          - action: script.zendure_calibration_revert
+          - stop: charging did not start
+
+      # ---- 6  wait for 100 %, then for the calibration flag to clear ----------------------------
+      - wait_template: "{{ states('sensor.zendure_total_state_of_charge') | float(0) >= 100 }}"
+        timeout: "{{ max_hours * 3600 - 1800 }}"
+        continue_on_timeout: true
+      - if:
+          - condition: template
+            value_template: "{{ not wait.completed }}"
+        then:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration did not finish
+              notification_id: zendure_calibration_result
+              message: >
+                Set {{ cal_set }} reached only {{ states('sensor.zendure_total_state_of_charge') }} %
+                within the time limit. Not recorded as calibrated. Reverted to the proxy.
+          - action: script.zendure_calibration_revert
+          - stop: 100 percent not reached
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.zendure_calibration_phase
+        data:
+          value: "set {{ cal_set }}: full, waiting for calibration"
+      - delay: "00:10:00"
+      - wait_template: "{{ is_state('sensor.zendure_calibrating', 'No') }}"
+        timeout: "02:00:00"
+        continue_on_timeout: true
+      - delay: "00:02:00"
+      - if:
+          - condition: template
+            value_template: >
+              {{ states('sensor.zendure_total_state_of_charge') | float(0) >= 99
+                 and is_state('sensor.zendure_calibrating', 'No') }}
+        then:
+          # ---- 7  success: record this set and hand control back --------------------------------
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: "input_datetime.zendure_calibration_last_set_{{ cal_set }}"
+            data:
+              datetime: "{{ now().strftime('%Y-%m-%d %H:%M:%S') }}"
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration done
+              notification_id: zendure_calibration_result
+              message: >
+                Set {{ cal_set }} ({{ real_ip }}) was charged from {{ start_soc }} % to
+                {{ states('sensor.zendure_total_state_of_charge') }} % and the calibration flag is clear.
+                Recorded as the last calibration run of set {{ cal_set }}. Gielz is resumed on the proxy.
+        else:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration not confirmed
+              notification_id: zendure_calibration_result
+              message: >
+                Set {{ cal_set }} is at {{ states('sensor.zendure_total_state_of_charge') }} % and calibrating is
+                {{ states('sensor.zendure_calibrating') }}. Not recorded; it will be tried again at the next check.
+      - action: script.zendure_calibration_revert
+
+  # ------------------------------------------------------------------------------------------
+  zendure_calibration_stop:
+    alias: Zendure calibration - stop and revert
+    mode: single
+    sequence:
+      - if:
+          - condition: state
+            entity_id: input_boolean.zendure_calibration_active
+            state: "on"
+        then:
+          - action: script.turn_off
+            target:
+              entity_id: script.zendure_calibration_run
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration stopped by hand
+              notification_id: zendure_calibration_result
+              message: The run was stopped manually. Reverting to the proxy now.
+          - action: script.zendure_calibration_revert
+        else:
+          - action: persistent_notification.create
+            data:
+              title: Zendure calibration
+              notification_id: zendure_calibration_result
+              message: No calibration run is active, so there is nothing to revert.
+
+automation:
+  # ------------------------------------------------------------------------------------------
+  - id: zendure_calibration_daily_check
+    alias: Zendure calibration - daily check
+    mode: single
+    triggers:
+      - trigger: time
+        at: input_datetime.zendure_calibration_check_time   # helper from zendure_calibration_next_run.yaml
+    conditions:
+      - condition: state
+        entity_id: input_boolean.zendure_calibration_active
+        state: "off"
+    variables:
+      # whole calendar days since the last run of each set
+      days_1: "{{ (now().date() - as_datetime(states('input_datetime.zendure_calibration_last_set_1')).date()).days }}"
+      days_2: "{{ (now().date() - as_datetime(states('input_datetime.zendure_calibration_last_set_2')).date()).days }}"
+      # 1 / 2 = set to start today, 0 = nothing today
+      pick: >
+        {% set a = days_1 | int(0) %}{% set b = days_2 | int(0) %}
+        {{ (1 if a >= b else 2) if (a >= 28 and b >= 28)
+           else (1 if a >= 28 else (2 if b >= 28
+           else ((1 if a >= b else 2) if (a >= 27 and b >= 27) else 0))) }}
+    actions:
+      - if:
+          - condition: template
+            value_template: "{{ pick | int(0) > 0 }}"
+        then:
+          - action: script.turn_on
+            target:
+              entity_id: script.zendure_calibration_run
+            data:
+              variables:
+                calibration_set: "{{ pick | int(0) }}"
+
+  # ------------------------------------------------------------------------------------------
+  - id: zendure_calibration_watchdog
+    alias: Zendure calibration - watchdog
+    mode: single
+    triggers:
+      - trigger: time_pattern
+        minutes: "/1"
+      - trigger: homeassistant
+        event: start
+    conditions:
+      - condition: state
+        entity_id: input_boolean.zendure_calibration_active
+        state: "on"
+    actions:
+      - choose:
+          - alias: Run script is gone (HA restart or crash)
+            conditions:
+              - condition: state
+                entity_id: script.zendure_calibration_run
+                state: "off"
+            sequence:
+              - action: persistent_notification.create
+                data:
+                  title: Zendure calibration interrupted
+                  notification_id: zendure_calibration_result
+                  message: The calibration run stopped unexpectedly. Everything was reverted to the proxy.
+              - action: script.zendure_calibration_revert
+          - alias: Deadline passed
+            conditions:
+              - condition: template
+                value_template: >
+                  {{ as_timestamp(now()) > (state_attr('input_datetime.zendure_calibration_deadline', 'timestamp') | float(0)) }}
+            sequence:
+              - action: script.turn_off
+                target:
+                  entity_id: script.zendure_calibration_run
+              - action: persistent_notification.create
+                data:
+                  title: Zendure calibration timed out
+                  notification_id: zendure_calibration_result
+                  message: The deadline passed. Everything was reverted to the proxy.
+              - action: script.zendure_calibration_revert

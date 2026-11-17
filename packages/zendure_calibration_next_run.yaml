@@ -1,0 +1,43 @@
+# Next planned calibration of each set (display only).
+# Rule: each set within 28 days of its last run; max one run per day (so >= 1 day
+# between the sets); if both would be due on consecutive days, the first one is
+# pulled earlier (day 27) so that neither exceeds 28 days.
+input_datetime:
+  zendure_calibration_check_time:
+    name: Zendure calibration check time
+    has_date: false
+    has_time: true
+
+template:
+  - sensor:
+      - name: "Zendure calibration plan"
+        unique_id: zendure_calibration_plan
+        state: >
+          {% set t = states('input_datetime.zendure_calibration_check_time') %}
+          {% set start = now().date() if now().strftime('%H:%M:%S') < t else now().date() + timedelta(days=1) %}
+          {% set ns = namespace(l1=as_datetime(states('input_datetime.zendure_calibration_last_set_1')).date(),
+                                l2=as_datetime(states('input_datetime.zendure_calibration_last_set_2')).date(),
+                                r1='', r2='') %}
+          {% for k in range(0, 150) %}
+            {% if ns.r1 == '' or ns.r2 == '' %}
+              {% set d = start + timedelta(days=k) %}
+              {% set a = (d - ns.l1).days %}
+              {% set b = (d - ns.l2).days %}
+              {% set pick = (1 if a >= b else 2) if (a >= 28 and b >= 28) else (1 if a >= 28 else (2 if b >= 28 else ((1 if a >= b else 2) if (a >= 27 and b >= 27) else 0))) %}
+              {% if pick == 1 and ns.r1 == '' %}{% set ns.r1 = d.isoformat() %}{% set ns.l1 = d %}
+              {% elif pick == 2 and ns.r2 == '' %}{% set ns.r2 = d.isoformat() %}{% set ns.l2 = d %}{% endif %}
+            {% endif %}
+          {% endfor %}
+          {{ ns.r1 }},{{ ns.r2 }}
+      - name: "Zendure set 1 next calibration"
+        unique_id: zendure_set_1_next_calibration
+        device_class: timestamp
+        state: >
+          {% set p = states('sensor.zendure_calibration_plan').split(',')[0] %}
+          {% if p %}{{ (p ~ ' ' ~ states('input_datetime.zendure_calibration_check_time')) | as_datetime | as_local }}{% else %}{{ none }}{% endif %}
+      - name: "Zendure set 2 next calibration"
+        unique_id: zendure_set_2_next_calibration
+        device_class: timestamp
+        state: >
+          {% set p = states('sensor.zendure_calibration_plan').split(',')[1] %}
+          {% if p %}{{ (p ~ ' ' ~ states('input_datetime.zendure_calibration_check_time')) | as_datetime | as_local }}{% else %}{{ none }}{% endif %}
